@@ -125,6 +125,9 @@ pub struct Shared {
     block_work_total: AtomicU64,
     /// When the final pass started (seconds since start) and how long it should take.
     final_eta: Mutex<Option<(f64, f64)>>,
+    /// When the current block started (seconds since start) and how long it should take
+    /// (0 if unknown).
+    block_clock: Mutex<(f64, f64)>,
     pub series_phase: Mutex<Phase>,
     pub convert_phase: Mutex<Phase>,
     pub final_pass: AtomicBool,
@@ -157,18 +160,26 @@ impl Shared {
         if to <= from || self.final_pass.load(Ordering::Acquire) {
             return state;
         }
-        let done = self.block_work_done.load(Ordering::Relaxed) as f64;
-        let total = self.block_work_total.load(Ordering::Relaxed).max(1) as f64;
-        let frac = (done / total).clamp(0.0, 1.0);
+        let frac = self.block_progress() as f64;
         let (a, b) = (shown_digits(from), shown_digits(to));
         state.max(a + (frac * (b - a) as f64) as u64)
     }
 
-    /// Fraction of the current block that's done (work-weighted).
+    /// Estimated fraction of the current block that's done. Measured progress only moves when
+    /// a multiplication finishes, and the largest ones take seconds, so it's combined with
+    /// time spent versus the planner's prediction for the block. The time-based part slows
+    /// down near the end and stays below 100 % until the block really is done.
     pub fn block_progress(&self) -> f32 {
         let done = self.block_work_done.load(Ordering::Relaxed) as f64;
         let total = self.block_work_total.load(Ordering::Relaxed).max(1) as f64;
-        (done / total).clamp(0.0, 1.0) as f32
+        let measured = (done / total).clamp(0.0, 1.0);
+        let (started, predicted) = *self.block_clock.lock().unwrap();
+        let timed = if predicted > 0.0 {
+            soft_cap((self.start.elapsed().as_secs_f64() - started) / predicted)
+        } else {
+            0.0
+        };
+        measured.max(timed) as f32
     }
 
     /// During the final pass: (estimated fraction done, estimated seconds left).
@@ -178,13 +189,23 @@ impl Shared {
             return Some((1.0, 0.0));
         }
         let spent = self.start.elapsed().as_secs_f64() - started;
-        let frac = (spent / predicted.max(1e-3)).min(0.99);
+        let frac = soft_cap(spent / predicted.max(1e-3));
         Some((frac as f32, (predicted - spent).max(0.0)))
     }
 
     fn series(&self, p: Phase) {
         *self.series_phase.lock().unwrap() = p;
     }
+}
+
+/// Maps an estimated fraction (which may exceed 1 if the estimate was short) to [0, 0.99):
+/// linear up to 0.9, then easing towards 0.99 so it keeps moving but never claims done.
+fn soft_cap(x: f64) -> f64 {
+    let x = x.max(0.0);
+    if x < 0.9 { x } else { 0.9 + 0.09 * (1.0 - (-(x - 0.9) / 0.09).exp()) }
+}
+
+impl Shared {
     fn convert(&self, p: Phase, preview: bool) {
         // Once the final pass has started, a still-running preview must not overwrite its phase.
         if preview && self.final_pass.load(Ordering::Acquire) {
@@ -237,6 +258,7 @@ pub fn start(budget: Duration) -> Arc<Shared> {
         block_work_done: AtomicU64::new(0),
         block_work_total: AtomicU64::new(1),
         final_eta: Mutex::new(None),
+        block_clock: Mutex::new((0.0, 0.0)),
         series_phase: Mutex::new(Phase::Idle),
         convert_phase: Mutex::new(Phase::Idle),
         final_pass: AtomicBool::new(false),
@@ -572,6 +594,8 @@ fn run(s: &Shared) {
     let mut last = false;
     // Whether the last block computes √10005 etc. alongside the series (else in the final pass).
     let mut overlap = true;
+    // Predicted duration of the next block (0 = unknown), for the live progress display.
+    let mut next_secs = 0.0f64;
     let mut prep: Option<Prep> = None;
 
     while !s.stop.load(Ordering::Relaxed) {
@@ -581,6 +605,7 @@ fn run(s: &Shared) {
         s.block_total.store(next - n, Ordering::Relaxed);
         s.block_work_done.store(0, Ordering::Relaxed);
         s.block_work_total.store(block_weight(next - n, next, acc.is_some()), Ordering::Relaxed);
+        *s.block_clock.lock().unwrap() = (s.start.elapsed().as_secs_f64(), next_secs);
         s.block_from.store(n, Ordering::Release);
         s.block_to.store(next, Ordering::Release);
         s.series(Phase::Series { from: n, to: next });
@@ -669,6 +694,7 @@ fn run(s: &Shared) {
         if SAFETY * series_t(n, full) + finish(full, step(full)) <= remaining {
             // A full doubling still leaves room for a final block afterwards.
             next = full;
+            next_secs = series_t(n, next);
         } else if finish(n, step(n)) > remaining {
             break; // out of time: convert what we have
         } else {
@@ -685,6 +711,8 @@ fn run(s: &Shared) {
             next = lo;
             last = true;
             overlap = finish_overlap(n, next) <= finish_seq(n, next);
+            let (st, pt) = (series_t(n, next), cp * work(next));
+            next_secs = if overlap { st.max(pt) + 0.5 * st.min(pt) } else { st };
         }
     }
 

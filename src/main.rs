@@ -74,8 +74,10 @@ struct PiApp {
     gpu: String,
     seen_generation: u64,
     snapshot: Option<Arc<Snapshot>>,
-    /// Live digit count shown, kept monotonic within a run.
+    /// Live digit count target, kept monotonic within a run, and the eased value shown.
     live_shown: u64,
+    live_display: f64,
+    last_frame: f64,
     new_result_at: f64,
     texture: Option<TextureHandle>,
     texture_side: usize,
@@ -113,6 +115,8 @@ impl PiApp {
             seen_generation: 0,
             snapshot: None,
             live_shown: 0,
+            live_display: 0.0,
+            last_frame: 0.0,
             new_result_at: -10.0,
             texture: None,
             texture_side: 0,
@@ -129,6 +133,7 @@ impl PiApp {
         self.seen_generation = 0;
         self.snapshot = None;
         self.live_shown = 0;
+        self.live_display = 0.0;
         self.texture_side = 0;
         self.status = None;
     }
@@ -199,7 +204,7 @@ impl eframe::App for PiApp {
             .exact_size(360.0)
             .resizable(false)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(16)))
-            .show(ui, |ui| self.stats(ui, done));
+            .show(ui, |ui| self.stats(ui, done, now));
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(16)))
             .show(ui, |ui| self.central(ui, now));
@@ -276,20 +281,55 @@ impl PiApp {
         );
     }
 
-    fn stats(&mut self, ui: &mut egui::Ui, done: bool) {
-        let e = &self.engine;
+    fn stats(&mut self, ui: &mut egui::Ui, done: bool, now: f64) {
+        let e = self.engine.clone();
         let digits = self.snapshot.as_ref().map_or(0, |s| s.digits.len() as u64);
+        let final_pass = e.final_pass.load(Ordering::Acquire);
 
-        // The live count follows the series as it's computed (every frame); decimal results
-        // arrive less often, because converting hundreds of millions of digits takes seconds.
+        // The live count follows the series as it's computed; decimal results arrive less
+        // often, because converting hundreds of millions of digits takes seconds. The shown
+        // value eases towards the target every frame so it never jumps.
         let live = if done { digits } else { e.live_digits().max(digits) };
         self.live_shown = self.live_shown.max(live);
-        ui.label(RichText::new(if done { "CORRECT DIGITS OF π" } else { "DIGITS OF π COMPUTED" }).size(12.0).color(DIM));
-        ui.label(RichText::new(group(self.live_shown)).size(36.0).monospace().strong().color(ACCENT));
+        let dt = (now - self.last_frame).clamp(0.0, 0.25);
+        self.last_frame = now;
+        if done {
+            self.live_display = digits as f64;
+        } else {
+            let target = self.live_shown as f64;
+            self.live_display += (target - self.live_display) * (1.0 - (-dt / 0.12).exp());
+            self.live_display = self.live_display.min(target);
+        }
+        let title = if done {
+            "CORRECT DIGITS OF π"
+        } else if final_pass {
+            "DIGITS OF π COMPUTED ✓"
+        } else {
+            "DIGITS OF π COMPUTED"
+        };
+        ui.label(RichText::new(title).size(12.0).color(DIM));
+        ui.label(
+            RichText::new(group(self.live_display.round() as u64))
+                .size(36.0)
+                .monospace()
+                .strong()
+                .color(ACCENT),
+        );
         if done {
             ui.label(
                 RichText::new(format!("final result after {:.2} s", e.elapsed())).color(GOOD),
             );
+        } else if let (true, Some((frac, _))) = (final_pass, e.final_progress()) {
+            // Estimated from the final pass's predicted duration: the division and the
+            // binary → decimal conversion don't report progress themselves.
+            let total = digits_target(&e);
+            ui.label(
+                RichText::new(format!("≈ {}", group((frac as f64 * total as f64) as u64)))
+                    .size(22.0)
+                    .monospace()
+                    .color(ACCENT2),
+            );
+            ui.label(RichText::new(format!("of {} converted to decimal (estimate)", group(total))).color(ACCENT2));
         } else if let Some(s) = &self.snapshot {
             ui.label(
                 RichText::new(format!(
@@ -306,7 +346,6 @@ impl PiApp {
         section(ui, "ENGINE");
         let series = e.series_phase.lock().unwrap().clone();
         let convert = e.convert_phase.lock().unwrap().clone();
-        let final_pass = e.final_pass.load(Ordering::Acquire);
         if !done {
             if matches!(series, Phase::Series { .. } | Phase::Merge) {
                 ui.label(RichText::new(series.label()).size(12.5));
@@ -326,8 +365,7 @@ impl PiApp {
                     ui.add(egui::ProgressBar::new(frac).desired_height(10.0).fill(ACCENT));
                     ui.label(
                         RichText::new(format!(
-                            "converting {} digits to decimal · ≈ {:.0} s left",
-                            group(digits_target(e)),
+                            "≈ {:.0} s left",
                             left.ceil()
                         ))
                         .size(12.5)
