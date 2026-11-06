@@ -482,7 +482,11 @@ fn run(s: &Shared) {
     let mut c_series = 0.0f64;
     let mut c_prep = 0.0f64;
     let mut c_conv = 0.0f64;
+    // √10005 + powers of ten on the full pool with nothing else running (from calibration).
+    let mut c_prep_full = 0.0f64;
     let mut last = false;
+    // Whether the last block computes √10005 etc. alongside the series (else in the final pass).
+    let mut overlap = true;
     let mut prep: Option<Prep> = None;
 
     while !s.stop.load(Ordering::Relaxed) {
@@ -491,7 +495,7 @@ fn run(s: &Shared) {
         s.block_done.store(0, Ordering::Relaxed);
         s.block_total.store(next - n, Ordering::Relaxed);
         s.series(Phase::Series { from: n, to: next });
-        let block = if last {
+        let block = if last && overlap {
             // Overlap the final conversion's setup with the last block.
             let d = digits_for(next);
             let (block, p) = rayon::join(|| split(n, next, s), || prepare(d));
@@ -538,6 +542,7 @@ fn run(s: &Shared) {
             let r = ratio(acc.as_ref().unwrap(), n);
             let digits = convert(&r, prep, s, false, &mut timing);
             c_conv = (timing.divide + timing.decimal) / work(n);
+            c_prep_full = timing.prep / work(n);
             if c_prep == 0.0 {
                 c_prep = timing.prep / work(n);
             }
@@ -551,13 +556,24 @@ fn run(s: &Shared) {
                 c_prep = snap.timing.prep / work(snap.terms);
             }
         }
-        let (cp, cc) = if c_conv > 0.0 { (c_prep, c_conv) } else { (c_series, 2.0 * c_series) };
+        let (cp, cpf, cc) = if c_conv > 0.0 {
+            (c_prep, c_prep_full, c_conv)
+        } else {
+            (c_series, c_series, 2.0 * c_series)
+        };
 
         // --- plan the next block ---
         let remaining = budget - s.start.elapsed().as_secs_f64();
         let series_t = |a: u64, b: u64| c_series * (work(b) - work(a));
-        // Time to run a last block a→m (with √10005 etc. overlapped) and then convert.
-        let finish = |a: u64, m: u64| SAFETY * (series_t(a, m).max(cp * work(m)) + cc * work(m));
+        // Time to run a last block a→m and then convert, either with √10005 etc. computed
+        // alongside the block, or afterwards on all cores. Alongside, both share the same
+        // cores, so they only partly overlap: measured ≈ the longer plus half the shorter.
+        let finish_overlap = |a: u64, m: u64| {
+            let (s, p) = (series_t(a, m), cp * work(m));
+            SAFETY * (s.max(p) + 0.5 * s.min(p) + cc * work(m))
+        };
+        let finish_seq = |a: u64, m: u64| SAFETY * (series_t(a, m) + (cpf + cc) * work(m));
+        let finish = |a: u64, m: u64| finish_overlap(a, m).min(finish_seq(a, m));
         let step = |m: u64| m + m / 50 + 1;
         let full = n * 2;
         if SAFETY * series_t(n, full) + finish(full, step(full)) <= remaining {
@@ -578,6 +594,7 @@ fn run(s: &Shared) {
             }
             next = lo;
             last = true;
+            overlap = finish_overlap(n, next) <= finish_seq(n, next);
         }
     }
 

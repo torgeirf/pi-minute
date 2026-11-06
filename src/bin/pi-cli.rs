@@ -1,14 +1,37 @@
-//! Headless runner: `pi-cli [seconds] [--out pi.txt]`
+//! Headless runner: `pi-cli [--seconds N] [--out pi.txt]`
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use pi_minute::engine;
 
+const HELP: &str = "\
+pi-cli: compute as many digits of pi as possible within a time limit
+
+USAGE:
+    pi-cli [OPTIONS] [SECONDS]
+
+OPTIONS:
+    -s, --seconds <N>   Time limit in seconds, 1-3600 (default 60). A bare number works too.
+    -o, --out <FILE>    Write the final digits (\"3.1415...\") to FILE
+    -h, --help          Show this help";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let secs: f64 = args.iter().find_map(|a| a.parse().ok()).unwrap_or(60.0);
-    let out = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).cloned();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{HELP}");
+        return;
+    }
+    let (secs, rest) = pi_minute::parse_seconds(&args).unwrap_or_else(|e| fail(&e));
+    let mut out = None;
+    let mut it = rest.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--out" => out = Some(it.next().unwrap_or_else(|| fail(&format!("{a} needs a file name")))),
+            _ => fail(&format!("unknown argument '{a}'")),
+        }
+    }
 
+    println!("computing pi for {secs} s on {} threads...", std::thread::available_parallelism().map_or(1, |n| n.get()));
     let s = engine::start(Duration::from_secs_f64(secs));
     let (mut seen, mut series_seen) = (0, 0);
     loop {
@@ -50,7 +73,12 @@ fn main() {
     if let Some(path) = out {
         let mut text = b"3.".to_vec();
         text.extend_from_slice(&snap.digits);
-        std::fs::write(&path, text).expect("write output");
+        std::fs::write(&path, text).unwrap_or_else(|e| fail(&format!("could not write {path}: {e}")));
         println!("wrote {path}");
     }
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("error: {msg}\n\n{HELP}");
+    std::process::exit(2);
 }

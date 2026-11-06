@@ -36,7 +36,14 @@ const DIGIT_COLORS: [Color32; 10] = [
 ];
 
 fn main() -> eframe::Result {
-    let secs: f64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(60.0);
+    // `--seconds N`, `-s N` or a bare number. There is no console (windows subsystem), so a
+    // bad argument is reported in the window instead and the default is used.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (secs, arg_error) = match pi_minute::parse_seconds(&args) {
+        Ok((s, rest)) if rest.is_empty() => (s, None),
+        Ok((s, rest)) => (s, Some(format!("Ignored unknown argument '{}'", rest[0]))),
+        Err(e) => (pi_minute::DEFAULT_SECONDS, Some(format!("{e}; using {}", pi_minute::DEFAULT_SECONDS))),
+    };
 
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
@@ -54,12 +61,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "pi-minute",
         options,
-        Box::new(move |cc| Ok(Box::new(PiApp::new(cc, secs)))),
+        Box::new(move |cc| Ok(Box::new(PiApp::new(cc, secs, arg_error)))),
     )
 }
 
 struct PiApp {
+    /// Time budget of the current/last run.
     budget: f64,
+    /// Time budget for the next run, as edited in the header.
+    next_budget: f64,
     engine: Arc<Shared>,
     gpu: String,
     seen_generation: u64,
@@ -73,7 +83,7 @@ struct PiApp {
 }
 
 impl PiApp {
-    fn new(cc: &eframe::CreationContext<'_>, budget: f64) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, budget: f64, arg_error: Option<String>) -> Self {
         let gpu = cc
             .wgpu_render_state
             .as_ref()
@@ -95,6 +105,7 @@ impl PiApp {
 
         Self {
             budget,
+            next_budget: budget,
             engine: engine::start(Duration::from_secs_f64(budget)),
             gpu,
             seen_generation: 0,
@@ -104,11 +115,13 @@ impl PiApp {
             texture_side: 0,
             scroll_to: None,
             goto_digit: 1,
-            status: None,
+            // Shown for a minute (see `header`), long enough to notice a bad argument.
+            status: arg_error.map(|e| (e, 54.0)),
         }
     }
 
     fn restart(&mut self) {
+        self.budget = self.next_budget;
         self.engine = engine::start(Duration::from_secs_f64(self.budget));
         self.seen_generation = 0;
         self.snapshot = None;
@@ -195,7 +208,11 @@ impl PiApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("π").size(40.0).color(ACCENT).strong());
             ui.vertical(|ui| {
-                let title = if self.budget == 60.0 { "in one minute".to_string() } else { format!("in {} seconds", self.budget) };
+                let title = match self.budget {
+                    60.0 => "in one minute".to_string(),
+                    1.0 => "in one second".to_string(),
+                    s => format!("in {} seconds", fmt_secs(s)),
+                };
                 ui.label(RichText::new(title).size(20.0).strong());
                 ui.label(
                     RichText::new("Chudnovsky · parallel binary splitting · rendered on the GPU")
@@ -214,9 +231,25 @@ impl PiApp {
             ui.label(RichText::new(clock).size(30.0).monospace().color(color));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_enabled(done, egui::Button::new("Run again")).clicked() {
+                let run = egui::Button::new(RichText::new("Run").strong());
+                if ui
+                    .add_enabled(done, run)
+                    .on_disabled_hover_text("Available when the current run has finished")
+                    .clicked()
+                {
                     self.restart();
                 }
+                ui.add_enabled(
+                    done,
+                    egui::DragValue::new(&mut self.next_budget)
+                        .range(pi_minute::MIN_SECONDS..=pi_minute::MAX_SECONDS)
+                        .speed(1.0)
+                        .max_decimals(1)
+                        .suffix(" s"),
+                )
+                .on_hover_text("Time limit for the next run: drag, or click to type (1–3600 s)");
+                ui.label(RichText::new("Time limit").color(DIM));
+                ui.add_space(12.0);
                 if ui
                     .add_enabled(self.snapshot.is_some(), egui::Button::new("Save digits"))
                     .clicked()
@@ -588,6 +621,11 @@ fn histogram(ui: &mut egui::Ui, h: &[u64; 10]) {
         FontId::proportional(10.5),
         DIM,
     );
+}
+
+/// "45" for whole seconds, "2.5" otherwise.
+fn fmt_secs(s: f64) -> String {
+    if s.fract() == 0.0 { format!("{s:.0}") } else { format!("{s}") }
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
