@@ -55,6 +55,11 @@ is a self-contained portable exe.
   in parallel on a rayon pool.
 * **Pipelined display:** a separate preview thread keeps converting the newest series
   state to decimal for the screen while the series keeps growing.
+* **Live counter:** the big digit count follows the series as it's computed, using
+  work-weighted progress through each block. It can pause for a second or two during
+  the largest multiplications. Decimal results (the digits you can read) arrive less
+  often, because converting hundreds of millions of digits takes seconds. A progress bar
+  with a time estimate covers the final conversion.
 * **Time planning:** block sizes come from measured timings (one calibration conversion
   at about 7M digits, plus the previews). The last block is sized so the final
   conversion ends just before the deadline. √10005 and the powers of ten for the final

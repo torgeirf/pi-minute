@@ -117,6 +117,14 @@ pub struct Shared {
     pub block_total: AtomicU64,
     /// Terms contained in the merged series state.
     pub series_terms: AtomicU64,
+    /// The block being added to the series: terms [block_from, block_to).
+    block_from: AtomicU64,
+    block_to: AtomicU64,
+    /// Work-weighted progress through the current block (see [`weight`]).
+    block_work_done: AtomicU64,
+    block_work_total: AtomicU64,
+    /// When the final pass started (seconds since start) and how long it should take.
+    final_eta: Mutex<Option<(f64, f64)>>,
     pub series_phase: Mutex<Phase>,
     pub convert_phase: Mutex<Phase>,
     pub final_pass: AtomicBool,
@@ -130,6 +138,8 @@ pub struct Shared {
     pending: Mutex<Option<Arc<Ratio>>>,
     pending_cv: Condvar,
     preview_stop: AtomicBool,
+    /// Serializes `publish`, so a preview finishing during the final pass can't overwrite it.
+    publish_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -139,6 +149,39 @@ impl Shared {
             None => self.start.elapsed().as_secs_f64(),
         }
     }
+    /// Digits of π the series has (approximately) reached right now, including progress
+    /// through the block being computed. Unlike results, this moves continuously.
+    pub fn live_digits(&self) -> u64 {
+        let state = shown_digits(self.series_terms.load(Ordering::Acquire));
+        let (from, to) = (self.block_from.load(Ordering::Acquire), self.block_to.load(Ordering::Acquire));
+        if to <= from || self.final_pass.load(Ordering::Acquire) {
+            return state;
+        }
+        let done = self.block_work_done.load(Ordering::Relaxed) as f64;
+        let total = self.block_work_total.load(Ordering::Relaxed).max(1) as f64;
+        let frac = (done / total).clamp(0.0, 1.0);
+        let (a, b) = (shown_digits(from), shown_digits(to));
+        state.max(a + (frac * (b - a) as f64) as u64)
+    }
+
+    /// Fraction of the current block that's done (work-weighted).
+    pub fn block_progress(&self) -> f32 {
+        let done = self.block_work_done.load(Ordering::Relaxed) as f64;
+        let total = self.block_work_total.load(Ordering::Relaxed).max(1) as f64;
+        (done / total).clamp(0.0, 1.0) as f32
+    }
+
+    /// During the final pass: (estimated fraction done, estimated seconds left).
+    pub fn final_progress(&self) -> Option<(f32, f64)> {
+        let (started, predicted) = (*self.final_eta.lock().unwrap())?;
+        if self.done.load(Ordering::Acquire) {
+            return Some((1.0, 0.0));
+        }
+        let spent = self.start.elapsed().as_secs_f64() - started;
+        let frac = (spent / predicted.max(1e-3)).min(0.99);
+        Some((frac as f32, (predicted - spent).max(0.0)))
+    }
+
     fn series(&self, p: Phase) {
         *self.series_phase.lock().unwrap() = p;
     }
@@ -189,6 +232,11 @@ pub fn start(budget: Duration) -> Arc<Shared> {
         block_done: AtomicU64::new(0),
         block_total: AtomicU64::new(1),
         series_terms: AtomicU64::new(0),
+        block_from: AtomicU64::new(0),
+        block_to: AtomicU64::new(0),
+        block_work_done: AtomicU64::new(0),
+        block_work_total: AtomicU64::new(1),
+        final_eta: Mutex::new(None),
         series_phase: Mutex::new(Phase::Idle),
         convert_phase: Mutex::new(Phase::Idle),
         final_pass: AtomicBool::new(false),
@@ -200,6 +248,7 @@ pub fn start(budget: Duration) -> Arc<Shared> {
         pending: Mutex::new(None),
         pending_cv: Condvar::new(),
         preview_stop: AtomicBool::new(false),
+        publish_lock: Mutex::new(()),
     });
 
     let s = shared.clone();
@@ -281,6 +330,7 @@ fn split(a: u64, b: u64, s: &Shared) -> Pqt {
     let n = b - a;
     if n == 1 {
         s.block_done.fetch_add(1, Ordering::Relaxed);
+        s.block_work_done.fetch_add(1, Ordering::Relaxed);
         return leaf(a);
     }
     let m = a + n / 2;
@@ -289,7 +339,41 @@ fn split(a: u64, b: u64, s: &Shared) -> Pqt {
     } else {
         (split(a, m, s), split(m, b, s))
     };
-    merge(l, r, n >= PAR_MUL_TERMS)
+    let merged = merge(l, r, n >= PAR_MUL_TERMS);
+    s.block_work_done.fetch_add(weight(n), Ordering::Relaxed);
+    merged
+}
+
+/// Progress weight of merging a range of `n` terms: the numbers grow linearly with `n` and
+/// FFT multiplication costs about n·log²n.
+fn weight(n: u64) -> u64 {
+    if n <= 1 {
+        return 1;
+    }
+    let l = (n as f64).log2();
+    (n as f64 * l * l) as u64
+}
+
+/// Total progress weight of `split` over `len` terms, plus merging the result into a series
+/// state that ends up with `total_terms` terms (if there is a state to merge into).
+fn block_weight(len: u64, total_terms: u64, has_state: bool) -> u64 {
+    // Every level of the splitting tree covers all `len` terms in nodes of about equal size.
+    let mut sum = len; // leaves
+    let (mut size, mut count) = (len as f64, 1.0f64);
+    while size >= 2.0 {
+        sum += (count * weight(size as u64) as f64) as u64;
+        size /= 2.0;
+        count *= 2.0;
+    }
+    if has_state {
+        sum += weight(total_terms);
+    }
+    sum
+}
+
+/// Digits shown for a series of `terms` terms (guard digits excluded).
+pub fn shown_digits(terms: u64) -> u64 {
+    digits_for(terms).saturating_sub(GUARD_DIGITS)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -406,6 +490,7 @@ impl Radix {
 }
 
 fn publish(s: &Shared, digits: Vec<u8>, terms: u64, convert_secs: f64, is_final: bool, timing: Timing) {
+    let _publishing = s.publish_lock.lock().unwrap();
     let prev = s.latest.lock().unwrap().clone();
     if prev.as_ref().is_some_and(|p| p.terms >= terms) {
         return; // a preview finishing late must not replace a newer, larger result
@@ -453,12 +538,12 @@ fn preview_loop(s: &Shared, pool: &rayon::ThreadPool) {
             let prep = prepare(digits_for(job.terms));
             timing.prep = t0.elapsed().as_secs_f64();
             let digits = convert(&job, prep, s, true, &mut timing);
-            if s.preview_stop.load(Ordering::Acquire) {
-                return true; // the final result is on its way; don't publish a stale one after it
-            }
+            // Publish even if the final pass has started: it's mostly single-threaded at
+            // first, so this last preview usually lands well before the final result and
+            // keeps the display moving. `publish` ignores it if the final result won.
             publish(s, digits, job.terms, t0.elapsed().as_secs_f64(), false, timing);
             s.convert(Phase::Idle, true);
-            false
+            s.preview_stop.load(Ordering::Acquire)
         });
         if stopped {
             return;
@@ -494,6 +579,10 @@ fn run(s: &Shared) {
         let t0 = Instant::now();
         s.block_done.store(0, Ordering::Relaxed);
         s.block_total.store(next - n, Ordering::Relaxed);
+        s.block_work_done.store(0, Ordering::Relaxed);
+        s.block_work_total.store(block_weight(next - n, next, acc.is_some()), Ordering::Relaxed);
+        s.block_from.store(n, Ordering::Release);
+        s.block_to.store(next, Ordering::Release);
         s.series(Phase::Series { from: n, to: next });
         let block = if last && overlap {
             // Overlap the final conversion's setup with the last block.
@@ -507,7 +596,11 @@ fn run(s: &Shared) {
         s.series(Phase::Merge);
         let merged = match acc.take() {
             None => block,
-            Some(prev) => merge(prev, block, true),
+            Some(prev) => {
+                let m = merge(prev, block, true);
+                s.block_work_done.fetch_add(weight(next), Ordering::Relaxed);
+                m
+            }
         };
         let series_secs = t0.elapsed().as_secs_f64();
         let w = (work(next) - work(n)).max(1.0);
@@ -516,10 +609,7 @@ fn run(s: &Shared) {
         }
         n = next;
         s.series_terms.store(n, Ordering::Relaxed);
-        s.series_history
-            .lock()
-            .unwrap()
-            .push((s.start.elapsed().as_secs_f64(), digits_for(n).saturating_sub(GUARD_DIGITS)));
+        s.series_history.lock().unwrap().push((s.start.elapsed().as_secs_f64(), shown_digits(n)));
 
         if last {
             acc = Some(merged);
@@ -605,6 +695,13 @@ fn run(s: &Shared) {
     s.series(Phase::Idle);
     let Some(acc) = acc else { return };
     let t0 = Instant::now();
+    let prep_ready = prep.as_ref().is_some_and(|p| p.d == digits_for(n));
+    let predicted = if c_conv > 0.0 {
+        (c_conv + if prep_ready { 0.0 } else { c_prep_full }) * work(n)
+    } else {
+        0.5 // tiny budgets end before calibration; the conversion is then tiny too
+    };
+    *s.final_eta.lock().unwrap() = Some((s.start.elapsed().as_secs_f64(), predicted));
     s.convert(Phase::Prepare, false);
     let r = ratio(&acc, n);
     drop(acc);

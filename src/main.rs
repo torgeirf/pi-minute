@@ -74,6 +74,8 @@ struct PiApp {
     gpu: String,
     seen_generation: u64,
     snapshot: Option<Arc<Snapshot>>,
+    /// Live digit count shown, kept monotonic within a run.
+    live_shown: u64,
     new_result_at: f64,
     texture: Option<TextureHandle>,
     texture_side: usize,
@@ -110,6 +112,7 @@ impl PiApp {
             gpu,
             seen_generation: 0,
             snapshot: None,
+            live_shown: 0,
             new_result_at: -10.0,
             texture: None,
             texture_side: 0,
@@ -125,6 +128,7 @@ impl PiApp {
         self.engine = engine::start(Duration::from_secs_f64(self.budget));
         self.seen_generation = 0;
         self.snapshot = None;
+        self.live_shown = 0;
         self.texture_side = 0;
         self.status = None;
     }
@@ -276,22 +280,24 @@ impl PiApp {
         let e = &self.engine;
         let digits = self.snapshot.as_ref().map_or(0, |s| s.digits.len() as u64);
 
-        ui.label(RichText::new("CORRECT DIGITS OF π").size(12.0).color(DIM));
-        ui.label(RichText::new(group(digits)).size(36.0).monospace().strong().color(ACCENT));
-        let pending = e
-            .series_history
-            .lock()
-            .unwrap()
-            .last()
-            .map_or(0, |&(_, d)| d);
-        if !done && pending > digits {
-            ui.label(
-                RichText::new(format!("series already holds {} digits — converting…", group(pending)))
-                    .color(ACCENT2),
-            );
-        } else if done {
+        // The live count follows the series as it's computed (every frame); decimal results
+        // arrive less often, because converting hundreds of millions of digits takes seconds.
+        let live = if done { digits } else { e.live_digits().max(digits) };
+        self.live_shown = self.live_shown.max(live);
+        ui.label(RichText::new(if done { "CORRECT DIGITS OF π" } else { "DIGITS OF π COMPUTED" }).size(12.0).color(DIM));
+        ui.label(RichText::new(group(self.live_shown)).size(36.0).monospace().strong().color(ACCENT));
+        if done {
             ui.label(
                 RichText::new(format!("final result after {:.2} s", e.elapsed())).color(GOOD),
+            );
+        } else if let Some(s) = &self.snapshot {
+            ui.label(
+                RichText::new(format!(
+                    "{} converted to decimal and shown ({:.0} s ago)",
+                    group(digits),
+                    (e.elapsed() - s.at).max(0.0)
+                ))
+                .color(ACCENT2),
             );
         }
         ui.add_space(10.0);
@@ -301,23 +307,35 @@ impl PiApp {
         let series = e.series_phase.lock().unwrap().clone();
         let convert = e.convert_phase.lock().unwrap().clone();
         let final_pass = e.final_pass.load(Ordering::Acquire);
-        let block_done = e.block_done.load(Ordering::Relaxed);
-        let block_total = e.block_total.load(Ordering::Relaxed).max(1);
         if !done {
-            if let Phase::Series { .. } = series {
+            if matches!(series, Phase::Series { .. } | Phase::Merge) {
                 ui.label(RichText::new(series.label()).size(12.5));
+                let p = e.block_progress();
                 ui.add(
-                    egui::ProgressBar::new(block_done as f32 / block_total as f32)
+                    egui::ProgressBar::new(p)
                         .desired_height(14.0)
                         .fill(ACCENT2)
-                        .text(format!("{} / {} terms", group(block_done), group(block_total))),
+                        .text(format!("series block {:.0} %", p * 100.0)),
                 );
             } else if series != Phase::Idle {
                 ui.label(RichText::new(series.label()).size(12.5));
             }
-            let who = if final_pass { "Final pass (all cores)" } else { "Preview" };
-            if convert != Phase::Idle {
-                ui.label(RichText::new(format!("{who}: {}", convert.label())).size(12.5).color(DIM));
+            if final_pass {
+                ui.label(RichText::new(format!("Final pass (all cores): {}", convert.label())).size(12.5));
+                if let Some((frac, left)) = e.final_progress() {
+                    ui.add(egui::ProgressBar::new(frac).desired_height(10.0).fill(ACCENT));
+                    ui.label(
+                        RichText::new(format!(
+                            "converting {} digits to decimal · ≈ {:.0} s left",
+                            group(digits_target(e)),
+                            left.ceil()
+                        ))
+                        .size(12.5)
+                        .color(ACCENT),
+                    );
+                }
+            } else if convert != Phase::Idle {
+                ui.label(RichText::new(format!("Preview: {}", convert.label())).size(12.5).color(DIM));
             }
         } else {
             ui.label(RichText::new("Finished").color(GOOD));
@@ -621,6 +639,11 @@ fn histogram(ui: &mut egui::Ui, h: &[u64; 10]) {
         FontId::proportional(10.5),
         DIM,
     );
+}
+
+/// Digits the series holds (what the final pass is converting).
+fn digits_target(e: &Shared) -> u64 {
+    engine::shown_digits(e.series_terms.load(Ordering::Acquire))
 }
 
 /// "45" for whole seconds, "2.5" otherwise.
